@@ -1,0 +1,322 @@
+==============================================================================
+CAMERA CONTROL - DETAILED NOTES
+==============================================================================
+History: this feature started as part of backend_fast (app/camera/manager.py
+talking to the Hikrobot SDK directly, in-process). A review turned up two
+critical bugs and a hard architectural problem (section 2), so the SDK-facing
+half was pulled out into this separate camera_service project, and
+backend_fast now only receives already-encoded JPEG frames over HTTP. This
+file explains what exists today, why it's split this way, and how to run it.
+
+
+------------------------------------------------------------------------------
+1. WHAT THIS FEATURE IS
+------------------------------------------------------------------------------
+A Hikrobot GigE (network) camera watches the dispensing/inspection station.
+Two things ride on it:
+
+  a) A live MJPEG monitor stream, so an operator can watch what the cobot is
+     doing in real time (shown in debug_frontend's "Send Prescription" tab).
+
+  b) A manual vision-inspection handshake with the PLC: the PLC raises a bit
+     (CAM_TRIG_DEVICE / M370) when it wants a capture/inspection judged, and
+     the operator (for now -- a classifier may replace this later) looks at
+     the stream and writes back OK (CAM_RESULT_OK_DEVICE / M372) or NG
+     (CAM_RESULT_NG_DEVICE / M373).
+
+The camera is a *fixed-IP* GigE device -- no network discovery
+(MV_CC_EnumDevices); the device-info struct is built directly from a known IP
+(CAMERA_IP), and the camera free-runs (grabs continuously) from the moment
+camera_service starts, independent of whether anyone is watching the stream.
+
+Two processes now make this work:
+
+  camera_service/    Runs on a Windows machine physically on the same LAN as
+                      the camera. Owns the Hikrobot SDK, connects, grabs
+                      frames, converts/resizes/JPEG-encodes them, and POSTs
+                      each one to backend_fast's /camera/ingest. Outbound
+                      HTTP only -- no inbound port needed on this machine.
+
+  backend_fast/       Runs wherever the rest of the API already runs (can be
+                      cloud). Has zero Hikrobot SDK dependency. Just receives
+                      frames via POST /camera/ingest and fans them out to
+                      whoever is watching /camera/stream or /camera/snapshot.
+                      Still talks to the PLC directly for the M370/M372/M373
+                      handshake (that part never needed the camera SDK).
+
+
+------------------------------------------------------------------------------
+2. WHY THIS IS SPLIT INTO TWO PROCESSES (don't just import the SDK into
+   backend_fast directly -- here's the reasoning, so nobody "simplifies" it
+   back into one process later without re-reading this)
+------------------------------------------------------------------------------
+
+2.1 The two bugs that started this review
+------------------------------------------
+When the camera code lived inside backend_fast, importing the FastAPI app at
+all (regardless of any "camera enabled" flag) tried to load the Hikrobot SDK
+at Python import time -- before the app object even existed, before any
+try/except in a lifespan hook could catch anything. On a fresh `docker compose
+build`, this failed twice over:
+  - requirements.txt had "opencv-python-headless==5.0.0", which is not a real
+    published PyPI version (confirmed with `pip index versions
+    opencv-python-headless` -- the real one is 5.0.0.93). Docker build failed
+    immediately at `pip install`.
+  - Even with that fixed, the SDK import itself crashes on Linux: the vendored
+    files are Windows DLLs only (vendor/mvs_runtime/Win64_x64/*.dll), there is
+    no libMvCameraControl.so vendored anywhere, and the SDK wrapper's Linux
+    code path does `os.getenv('MVCAM_COMMON_RUNENV') + "/64/libMvCameraControl.so"`
+    -- which is `None + str` (TypeError) the moment MVCAM_COMMON_RUNENV isn't
+    set, which it never is on a fresh container. This crash happened at
+    process boot, before uvicorn could even bind a port, taking down every
+    other route (PLC, prescription, everything) along with it.
+
+Both were fixed in-place first (correct pin + lazy-loading the SDK only
+inside CameraManager.start()) -- but fixing them only meant the app could
+*boot* without a camera. It did not solve the underlying problem below, which
+is why a second, bigger change followed: pulling the SDK out of backend_fast
+entirely.
+
+2.2 The deeper problem: GigE Vision needs to be on the same LAN segment
+-------------------------------------------------------------------------
+We'd already established that the PLC's MC Protocol traffic (plain TCP
+request/response, tiny payloads -- read/write a handful of bits or words)
+tolerates running over a VPN/tunnel from a cloud server just fine. The camera
+does not get the same free pass:
+
+  1. GigE Vision (the camera's protocol) streams over UDP continuously
+     (free-run video), not a handful of small register reads. WAN-grade
+     latency/jitter/packet loss over a VPN causes visible frame
+     corruption/drops in a way a slow PLC bit read never would.
+
+  2. MV_CC_GetOptimalPacketSize() negotiates the GigE packet size against the
+     *actual physical link* between the host NIC (CAMERA_NET_IP) and the
+     camera. This assumes a real, low-latency local-segment link; a VPN
+     tunnel's effective MTU/latency doesn't match what this negotiation
+     expects.
+
+  3. GVSP (the streaming sub-protocol) has the camera push UDP packets back to
+     whatever IP:port the controller negotiated. NAT -- almost always present
+     crossing from a cloud VM into a factory LAN -- breaks this return path
+     unless very carefully configured (and even then it's fragile). MC
+     Protocol's simple client-initiated TCP request/response has no such
+     problem.
+
+Bottom line: this camera hardware is designed to be controlled by something
+L2-adjacent (same physical/local network segment) to it, not something reached
+over a routed WAN tunnel. So "camera control" and "PLC control" fundamentally
+have different deployment constraints, even if it's tempting to lump them into
+one backend process because they both happen to serve the same feature.
+
+2.3 The three options considered, and why we picked this one
+----------------------------------------------------------------
+  A) Run the *entire* backend_fast on a machine physically on the camera's
+     LAN. Zero porting work, but forces the whole API (PLC, prescriptions, DB)
+     onto whatever machine happens to be near the camera -- not acceptable
+     here because the team wants the main API centralized (e.g. in the cloud).
+
+  B) [CHOSEN] Keep backend_fast wherever it already runs. Run a small,
+     separate camera_service process on a Windows machine on the factory LAN.
+     It owns the SDK and pushes already-JPEG-encoded frames to backend_fast
+     over plain HTTP POST -- ordinary TCP, tunnels/NAT/cloud-facing URLs fine,
+     no GigE Vision networking assumptions ever cross the WAN. backend_fast
+     just re-serves whatever frame it last received. This is what exists
+     today.
+
+  C) Port the SDK to Linux (get the real libMvCameraControl.so + dependencies
+     from Hikrobot for the target architecture, vendor it, update the
+     Dockerfile, run the container with host/macvlan networking so it's
+     L2-present on the camera's subnet). Technically possible, but the most
+     effort, and still fighting the same same-subnet/bandwidth constraints
+     from 2.2 -- just from inside a container instead of a cloud VM. Not worth
+     it when B solves the same problem with far less risk.
+
+A useful way to say this to the team in one sentence: **the camera isn't just
+"another PLC-style device we forgot to route through the VPN" -- it's a
+fundamentally different kind of network citizen that must live next to the
+hardware, so we gave it its own tiny process instead of fighting that.**
+
+
+------------------------------------------------------------------------------
+3. WHY /camera/ingest NEEDS A TOKEN
+------------------------------------------------------------------------------
+Once backend_fast lives somewhere with a real, internet-reachable URL,
+POST /camera/ingest is an endpoint anyone on the internet could find (by
+guessing, scanning, or just watching network traffic) and POST arbitrary JPEG
+bytes to. Without a check, that would let a stranger silently replace what
+/camera/stream and /camera/snapshot show -- and this feed is what the
+operator's OK/NG dispensing decision is based on. A spoofed frame isn't just
+"ugly," it's a path to a wrong medicine-dispensing judgment.
+
+CAMERA_INGEST_TOKEN is the minimum viable fix for that: a shared secret that
+camera_service sends as the `X-Camera-Token` header on every push, checked
+against backend_fast's own copy of the same value. No accounts, no expiry, no
+OAuth flow -- just "only whoever holds this string may write frames." It has
+to be identical in both camera_service/.env (CLOUD_INGEST_TOKEN) and
+backend_fast/.env (CAMERA_INGEST_TOKEN). If this ever needs to be
+internet-facing at real scale (not just this internal tool), consider
+upgrading to per-device tokens with rotation, but for now a single shared
+value is enough.
+
+
+------------------------------------------------------------------------------
+4. FILE MAP -- WHAT EACH PART CONTROLS
+------------------------------------------------------------------------------
+
+camera_service/ (new project, runs on the LAN, next to the camera)
+--------------------------------------------------------------------
+  config.py         Plain os.getenv-based settings (no FastAPI/pydantic --
+                    this isn't a web server). CAMERA_IP, CAMERA_NET_IP,
+                    STREAM_MAX_WIDTH (downscale target before JPEG-encoding --
+                    kept at full FPS but smaller resolution, to control
+                    bandwidth without hurting motion smoothness),
+                    JPEG_QUALITY, CLOUD_INGEST_URL, CLOUD_INGEST_TOKEN.
+
+  sdk_path.py       Same idea as the old backend_fast version, path depth
+                    adjusted: vendor/mvimport added to sys.path, and on
+                    Windows os.add_dll_directory(vendor/mvs_runtime/Win64_x64)
+                    so WinDLL("MvCameraControl.dll") resolves without the SDK
+                    installer having touched the system PATH. Confirmed the
+                    vendored Win64_x64 folder already bundles its own VC++
+                    runtime DLLs (msvcp90/120.dll etc.) -- nothing besides
+                    Python + this folder needs installing on the target
+                    machine.
+
+  capture.py        The actual SDK interaction -- connect (fixed IP, no
+                    discovery), MV_CC_GetOptimalPacketSize/SetIntValue
+                    (packet-size negotiation, assumes same LAN segment --
+                    see section 2.2), TriggerMode OFF (free-run),
+                    SetBayerCvtQuality, StartGrabbing, then loop
+                    GetImageBuffer -> convert to BGR8
+                    (MV_CC_ConvertPixelTypeEx) -> resize to STREAM_MAX_WIDTH
+                    -> cv2.imencode to JPEG -> FreeImageBuffer. Wrapped in a
+                    reconnect loop (any failure -> teardown -> wait
+                    CAMERA_RECONNECT_SECONDS -> retry) so a camera outage is
+                    self-healing rather than fatal to the process.
+
+  main.py           Entry point. Wires capture.run()'s per-frame callback to
+                    an httpx.Client POST against CLOUD_INGEST_URL with the
+                    X-Camera-Token header. A push failure (cloud briefly
+                    unreachable) is logged and the frame is dropped -- it
+                    never blocks or crashes the capture loop, next frame just
+                    tries again. Handles SIGINT/SIGTERM for clean shutdown.
+
+backend_fast/app/camera/frame_hub.py (replaces the old manager.py)
+---------------------------------------------------------------------
+  FrameHub          Pure in-memory latest-frame store + per-viewer fan-out.
+                    No SDK, no cv2, no numpy, no platform-specific code at
+                    all -- this is why backend_fast now builds and runs on
+                    Linux/Docker with no special handling needed.
+    ingest()          Called by the /camera/ingest route with each frame's
+                      raw JPEG bytes. Stores it as "latest," stamps a
+                      last-received timestamp (used for the `connected`
+                      property), and pushes it into every subscriber's
+                      asyncio.Queue(maxsize=1) via loop.call_soon_threadsafe
+                      -- same "always keep only the newest frame, never make
+                      anything wait" fan-out design as the old CameraManager.
+    connected         True only if a frame arrived in roughly the last 5s --
+                      this is now the definition of "is the camera up," since
+                      backend_fast can no longer ask the SDK directly.
+    subscribe() /
+    unsubscribe()     Used by the MJPEG route, same as before.
+
+app/api/routes/camera.py -- HTTP surface
+------------------------------------------
+  POST /camera/ingest             Receives one JPEG frame's raw bytes from
+                                   camera_service. Requires header
+                                   X-Camera-Token == CAMERA_INGEST_TOKEN or
+                                   401s (see section 3).
+  GET  /camera/status              {"connected": bool} from FrameHub.
+  GET  /camera/snapshot             Latest JPEG as image/jpeg, or 503 if none
+                                   has ever arrived.
+  GET  /camera/stream                The MJPEG live stream (multipart/
+                                   x-mixed-replace). Uses asyncio.wait_for
+                                   with CAMERA_STREAM_IDLE_TIMEOUT_SECONDS on
+                                   each queue.get() -- if nothing arrives for
+                                   that long *and* FrameHub isn't connected,
+                                   the generator ends and the connection
+                                   closes, instead of hanging open forever
+                                   (this was a minor bug in the original
+                                   version -- fixed).
+  GET  /camera/trigger-status       Reads CAM_TRIG_DEVICE from the PLC
+                                   directly (one-shot, not cached) -- "is the
+                                   PLC currently asking for an inspection?"
+                                   Unrelated to the camera SDK, unaffected by
+                                   any of the above.
+  POST /camera/inspection-result    Operator's OK/NG decision -> writes
+                                   CAM_RESULT_OK_DEVICE or CAM_RESULT_NG_DEVICE
+                                   = 1 on the PLC and leaves it set -- by
+                                   design, the PLC program is expected to read
+                                   and clear it itself. Also unrelated to the
+                                   camera SDK.
+
+app/main.py -- lifespan wiring
+--------------------------------
+  On startup, just does frame_hub.bind_loop(asyncio.get_running_loop()) so
+  FrameHub can safely schedule call_soon_threadsafe from camera_service's
+  side later. No SDK start/stop here anymore -- there is nothing to start or
+  stop on this side of the split.
+
+debug_frontend/ (app.js + index.html)
+---------------------------------------
+  Unchanged by the split -- it only ever talked to the HTTP surface above, so
+  it doesn't know or care that the camera moved to a separate process.
+
+
+------------------------------------------------------------------------------
+5. HOW TO ACTUALLY BRING THE CAMERA UP
+------------------------------------------------------------------------------
+
+On the Windows machine physically on the camera's LAN (running camera_service):
+  1. Copy the whole camera_service/ folder there (it already contains
+     vendor/mvimport and vendor/mvs_runtime/Win64_x64 -- nothing else needs
+     installing; no need to run the MVS_STD installer on this machine).
+  2. Install Python (any 64-bit 3.12-3.14ish build), create a venv, and
+     `pip install -r requirements.txt`.
+  3. Set that machine's NIC to a static IP on the camera's subnet (plain
+     Windows networking, unrelated to the SDK).
+  4. Edit .env: CAMERA_IP (camera's real IP), CAMERA_NET_IP (this host's NIC
+     IP), CLOUD_INGEST_URL (backend_fast's real URL + /camera/ingest),
+     CLOUD_INGEST_TOKEN (must match backend_fast's CAMERA_INGEST_TOKEN
+     exactly).
+  5. `python main.py`. Watch the logs for "Camera connected at <ip>, free-run
+     grabbing started" -- if it instead keeps logging "Camera capture loop
+     crashed, will retry" every CAMERA_RECONNECT_SECONDS, the most common
+     causes are: wrong CAMERA_IP, this host's NIC not actually on the
+     camera's subnet, or another process (e.g. Hikrobot's own MVS viewer
+     tool) already holding the camera open (MV_CC_OpenDevice uses exclusive
+     access -- only one process may have the camera open at a time).
+
+On backend_fast (wherever it runs, cloud included):
+  1. Set CAMERA_INGEST_TOKEN in .env to the same value as camera_service's
+     CLOUD_INGEST_TOKEN.
+  2. Nothing else camera-specific to configure -- no CAMERA_IP, no SDK, no
+     vendor/ folder needed here at all anymore.
+  3. Once camera_service is pushing, GET /camera/status should show
+     {"connected": true}, and /camera/snapshot / /camera/stream should serve
+     real frames.
+
+
+------------------------------------------------------------------------------
+6. STILL OPEN / NOT YET DONE
+------------------------------------------------------------------------------
+  - Never tested against the real physical camera -- everything above was
+    verified with the SDK loading correctly and reaching MV_CC_OpenDevice
+    (which fails with a real error code because no camera is plugged in on
+    the dev machine, not because of a code bug). The actual CAMERA_IP/
+    CAMERA_NET_IP values for the real factory network still need to be
+    filled in and tried against real hardware.
+  - STREAM_MAX_WIDTH=960 / JPEG_QUALITY=80 are reasonable starting guesses,
+    not measured against the real camera's native resolution or the real
+    network's actual available bandwidth -- expect to tune these once
+    running against real hardware and a real link.
+  - The OK/NG judgment is entirely manual today (operator looks at the
+    stream, clicks a button). CAM_TRIG_DEVICE/CAM_RESULT_OK_DEVICE/
+    CAM_RESULT_NG_DEVICE were deliberately kept as a single well-defined
+    handshake so a future classifier can call POST /camera/inspection-result
+    itself instead of a human clicking -- no protocol change needed on the
+    PLC side when that happens.
+  - CAMERA_INGEST_TOKEN is a single shared secret today (see section 3) --
+    fine for one camera_service instance, would need revisiting if this ever
+    needs to support multiple independent camera_service deployments pushing
+    to the same backend_fast.

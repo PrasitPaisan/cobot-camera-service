@@ -1,0 +1,215 @@
+"""
+Owns the Hikrobot GigE camera: connects by fixed IP, free-runs, converts each
+frame to BGR8, downsizes it, and JPEG-encodes it. Calls on_frame() with the
+encoded bytes for every frame -- main.py wires that callback to push to the
+cloud, same as the continuous stream always has.
+
+Separately, when a PLC camera-trigger edge comes in (snap_event, set by
+app/plc/trigger.py), the current full-resolution frame is also handed to
+on_trigger_frame() as a raw BGR array -- main.py wires that to save a snapshot
+to disk, independent of the (resized) stream.
+"""
+
+import logging
+import threading
+from ctypes import c_ubyte, memset, byref, sizeof
+from typing import Callable, Optional
+
+import cv2
+import numpy as np
+
+from app.config import settings
+
+logger = logging.getLogger("camera_service.capture")
+
+_SDK_NAMES = (
+    "MvCamera",
+    "MV_CC_DEVICE_INFO",
+    "MV_GIGE_DEVICE_INFO",
+    "MV_GIGE_DEVICE",
+    "MV_ACCESS_Exclusive",
+    "MV_TRIGGER_MODE_OFF",
+    "MV_FRAME_OUT",
+    "MV_CC_PIXEL_CONVERT_PARAM_EX",
+    "PixelType_Gvsp_BGR8_Packed",
+)
+_sdk_loaded = False
+
+
+def _load_sdk() -> None:
+    global _sdk_loaded
+    if _sdk_loaded:
+        return
+
+    from app.camera.sdk_path import ensure_sdk_importable
+
+    ensure_sdk_importable()
+
+    import MvCameraControl_class as _mv
+
+    for name in _SDK_NAMES:
+        globals()[name] = getattr(_mv, name)
+    _sdk_loaded = True
+
+
+def _ip_to_int(ip: str) -> int:
+    a, b, c, d = (int(part) for part in ip.split("."))
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def _frame_to_bgr(cam, frame) -> Optional[np.ndarray]:
+    """Full-resolution BGR8 conversion of the current frame buffer, no resizing."""
+    width = frame.stFrameInfo.nWidth
+    height = frame.stFrameInfo.nHeight
+
+    dst_size = width * height * 3
+    convert_param = MV_CC_PIXEL_CONVERT_PARAM_EX()
+    memset(byref(convert_param), 0, sizeof(convert_param))
+    convert_param.nWidth = width
+    convert_param.nHeight = height
+    convert_param.pSrcData = frame.pBufAddr
+    convert_param.nSrcDataLen = frame.stFrameInfo.nFrameLen
+    convert_param.enSrcPixelType = frame.stFrameInfo.enPixelType
+    convert_param.enDstPixelType = PixelType_Gvsp_BGR8_Packed
+    convert_param.pDstBuffer = (c_ubyte * dst_size)()
+    convert_param.nDstBufferSize = dst_size
+
+    ret = cam.MV_CC_ConvertPixelTypeEx(convert_param)
+    if ret != 0:
+        logger.warning("Pixel convert failed, ret[0x%x]", ret)
+        return None
+
+    buf = np.ctypeslib.as_array(convert_param.pDstBuffer, shape=(convert_param.nDstLen,))
+    # Copy out of the SDK-owned buffer -- it's reused/freed as soon as
+    # MV_CC_FreeImageBuffer runs, right after this function returns.
+    return buf.reshape((height, width, 3)).copy()
+
+
+def _bgr_to_stream_jpeg(bgr: np.ndarray) -> Optional[bytes]:
+    height, width = bgr.shape[:2]
+    max_width = settings.STREAM_MAX_WIDTH
+    if max_width and width > max_width:
+        scale = max_width / width
+        bgr = cv2.resize(bgr, (max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
+
+    ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, settings.JPEG_QUALITY])
+    if not ok:
+        logger.warning("JPEG encode failed")
+        return None
+    return encoded.tobytes()
+
+
+def _teardown_camera(cam) -> None:
+    if cam is None:
+        return
+    for method in ("MV_CC_StopGrabbing", "MV_CC_CloseDevice", "MV_CC_DestroyHandle"):
+        try:
+            getattr(cam, method)()
+        except Exception:
+            pass
+
+
+def _connect_and_grab_loop(
+    on_frame: Callable[[bytes], None],
+    on_trigger_frame: Callable[[np.ndarray], None],
+    snap_event: threading.Event,
+    stop_event: threading.Event,
+) -> None:
+    cam = MvCamera()
+    try:
+        dev_info = MV_CC_DEVICE_INFO()
+        gige_info = MV_GIGE_DEVICE_INFO()
+        gige_info.nCurrentIp = _ip_to_int(settings.CAMERA_IP)
+        gige_info.nNetExport = _ip_to_int(settings.CAMERA_NET_IP)
+        dev_info.nTLayerType = MV_GIGE_DEVICE
+        dev_info.SpecialInfo.stGigEInfo = gige_info
+
+        ret = cam.MV_CC_CreateHandle(dev_info)
+        if ret != 0:
+            raise RuntimeError(f"create handle fail! ret[0x{ret:x}]")
+
+        ret = cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+        if ret != 0:
+            raise RuntimeError(f"open device fail! ret[0x{ret:x}]")
+
+        n_packet_size = cam.MV_CC_GetOptimalPacketSize()
+        if int(n_packet_size) > 0:
+            ret = cam.MV_CC_SetIntValue("GevSCPSPacketSize", n_packet_size)
+            if ret != 0:
+                logger.warning("Set packet size failed, ret[0x%x]", ret)
+        else:
+            logger.warning("Get optimal packet size failed, ret[0x%x]", n_packet_size)
+
+        ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+        if ret != 0:
+            raise RuntimeError(f"set trigger mode fail! ret[0x{ret:x}]")
+
+        # Same underlying GenICam features MVS's one-click brightness button
+        # sets -- fixes the camera opening dark by self-adjusting exposure/gain
+        # instead of relying on whatever default the camera powered up with.
+        ret = cam.MV_CC_SetEnumValueByString("ExposureAuto", settings.CAMERA_EXPOSURE_AUTO)
+        if ret != 0:
+            logger.warning(
+                "Set ExposureAuto=%s failed, ret[0x%x]", settings.CAMERA_EXPOSURE_AUTO, ret
+            )
+
+        ret = cam.MV_CC_SetEnumValueByString("GainAuto", settings.CAMERA_GAIN_AUTO)
+        if ret != 0:
+            logger.warning("Set GainAuto=%s failed, ret[0x%x]", settings.CAMERA_GAIN_AUTO, ret)
+
+        ret = cam.MV_CC_SetBayerCvtQuality(1)
+        if ret != 0:
+            logger.warning("Set Bayer convert quality failed, ret[0x%x]", ret)
+
+        ret = cam.MV_CC_StartGrabbing()
+        if ret != 0:
+            raise RuntimeError(f"start grabbing fail! ret[0x{ret:x}]")
+
+        logger.info("Camera connected at %s, free-run grabbing started", settings.CAMERA_IP)
+
+        consecutive_errors = 0
+        frame = MV_FRAME_OUT()
+        while not stop_event.is_set():
+            memset(byref(frame), 0, sizeof(frame))
+            ret = cam.MV_CC_GetImageBuffer(frame, settings.CAMERA_GET_FRAME_TIMEOUT_MS)
+            if ret != 0 or frame.pBufAddr is None:
+                consecutive_errors += 1
+                if consecutive_errors >= settings.CAMERA_MAX_CONSECUTIVE_ERRORS:
+                    raise RuntimeError(f"too many consecutive grab failures, last ret[0x{ret:x}]")
+                continue
+            consecutive_errors = 0
+
+            try:
+                bgr = _frame_to_bgr(cam, frame)
+                if bgr is not None:
+                    jpeg_bytes = _bgr_to_stream_jpeg(bgr)
+                    if jpeg_bytes is not None:
+                        on_frame(jpeg_bytes)
+
+                    if snap_event.is_set():
+                        on_trigger_frame(bgr)
+                        snap_event.clear()
+            finally:
+                cam.MV_CC_FreeImageBuffer(frame)
+    finally:
+        _teardown_camera(cam)
+
+
+def run(
+    on_frame: Callable[[bytes], None],
+    on_trigger_frame: Callable[[np.ndarray], None],
+    snap_event: threading.Event,
+    stop_event: threading.Event,
+) -> None:
+    """Blocks until stop_event is set, reconnecting on any SDK/camera failure."""
+    _load_sdk()
+    MvCamera.MV_CC_Initialize()
+    try:
+        while not stop_event.is_set():
+            try:
+                _connect_and_grab_loop(on_frame, on_trigger_frame, snap_event, stop_event)
+            except Exception:
+                logger.exception("Camera capture loop crashed, will retry")
+            stop_event.wait(settings.CAMERA_RECONNECT_SECONDS)
+    finally:
+        MvCamera.MV_CC_Finalize()
