@@ -24,21 +24,12 @@ class Settings:
     CAMERA_RECONNECT_SECONDS = _env_float("CAMERA_RECONNECT_SECONDS", 3)
     CAMERA_MAX_CONSECUTIVE_ERRORS = _env_int("CAMERA_MAX_CONSECUTIVE_ERRORS", 10)
 
-    # Same FPS as the camera's free-run rate -- only the resolution is reduced before
-    # JPEG encoding, to keep the push to cloud smooth without eating a lot of bandwidth.
-    STREAM_MAX_WIDTH = _env_int("STREAM_MAX_WIDTH", 960)
-    JPEG_QUALITY = _env_int("JPEG_QUALITY", 80)
-
     # GenICam auto-exposure/auto-gain mode, applied once right after the camera
     # opens -- same underlying feature as MVS's one-click brightness adjustment.
     # One of "Off" / "Once" / "Continuous". Continuous keeps self-correcting
     # brightness as the scene's lighting changes, fixing "camera opens dark".
     CAMERA_EXPOSURE_AUTO = os.getenv("CAMERA_EXPOSURE_AUTO", "Continuous")
     CAMERA_GAIN_AUTO = os.getenv("CAMERA_GAIN_AUTO", "Continuous")
-
-    CLOUD_INGEST_URL = os.getenv("CLOUD_INGEST_URL", "http://localhost:8000/camera/ingest")
-    CLOUD_INGEST_TOKEN = os.getenv("CLOUD_INGEST_TOKEN", "")
-    CLOUD_PUSH_TIMEOUT_SECONDS = _env_float("CLOUD_PUSH_TIMEOUT_SECONDS", 3)
 
     # Same PLC that backend_fast talks to, but on its own dedicated port --
     # camera_service never shares a connection slot with backend_fast's

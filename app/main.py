@@ -1,23 +1,21 @@
 """
-Standalone LAN-side process: owns the camera, continuously pushes each JPEG
-frame to the cloud backend_fast's /camera/ingest endpoint (same as always),
-and separately watches the PLC's camera-trigger bit over MC protocol to judge
-each trigger capture OK/NG every time the PLC triggers a capture. No inbound
-port needed on this machine at all -- everything here is an outbound call
-(PLC read/write + HTTP POST) or a local file write.
+Standalone LAN-side process: owns the camera and watches the PLC's
+camera-trigger bit over MC protocol, judging each trigger capture OK/NG.
+No live stream, no cloud push, no inbound port needed on this machine at
+all -- everything here is an outbound call (PLC read/write) or a local
+file write.
 
 app/plc/trigger.py polls the trigger bit and sets snap_event on every 0 -> 1
-edge. app/camera/capture.py free-runs the camera internally and calls
-on_frame() with every (resized) frame for the stream, same as before; it
-additionally calls on_trigger_frame() with the full-resolution frame whenever
-snap_event is set. That callback hands off to a single background worker
-(_inspect_loop) that, in order: runs the frame through app/vision/detector.py
-(the ampoule YOLO model), pulses the result back to the PLC via
-app/plc/result.py (CAM_RESULT_OK_DEVICE / CAM_RESULT_NG_DEVICE) -- the cobot
-is waiting on this, so it goes out before anything below -- and only then
-saves one copy of the frame, sorted into TRAINING_DATA_DIR/OK or /NG: boxed
-(annotated) for OK, plain for NG. None of this ever blocks the camera grab
-loop.
+edge. app/camera/capture.py sits idle until snap_event is set, then fires
+the camera's software trigger, grabs exactly one full-resolution frame, and
+calls on_trigger_frame() with it. That callback hands off to a single
+background worker (_inspect_loop) that, in order: runs the frame through
+app/vision/detector.py (the ampoule YOLO model), pulses the result back to
+the PLC via app/plc/result.py (CAM_RESULT_OK_DEVICE / CAM_RESULT_NG_DEVICE)
+-- the cobot is waiting on this, so it goes out before anything below --
+and only then saves one copy of the frame, sorted into TRAINING_DATA_DIR/OK
+or /NG: boxed (annotated) for OK, plain for NG. None of this ever blocks
+the camera.
 
 Run with: python main.py (from the project root)
 """
@@ -30,7 +28,6 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-import httpx
 import numpy as np
 
 from app.camera import capture
@@ -52,24 +49,6 @@ _stop_event = threading.Event()
 def _handle_signal(signum, frame):
     logger.info("Received signal %s, shutting down...", signum)
     _stop_event.set()
-
-
-def _push_loop(frame_queue: "queue.Queue[bytes]", client: httpx.Client) -> None:
-    headers = {"Content-Type": "image/jpeg", "X-Camera-Token": settings.CLOUD_INGEST_TOKEN}
-    while not _stop_event.is_set():
-        try:
-            jpeg_bytes = frame_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        try:
-            resp = client.post(settings.CLOUD_INGEST_URL, content=jpeg_bytes, headers=headers)
-            if resp.status_code != 200:
-                logger.warning("Ingest push rejected: %s %s", resp.status_code, resp.text)
-        except httpx.HTTPError as e:
-            # Cloud briefly unreachable -- drop this frame and keep going, next
-            # frame will just try again. Never let a push failure stall the camera.
-            logger.warning("Ingest push failed: %s", e)
 
 
 def _inspect_loop(inspect_queue: "queue.Queue[tuple[str, np.ndarray]]", busy_event: threading.Event) -> None:
@@ -126,11 +105,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    client = httpx.Client(timeout=settings.CLOUD_PUSH_TIMEOUT_SECONDS)
-    frame_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=1)
-    # Unbounded: unlike the live stream, a trigger snapshot (or its inspection
-    # result) must never be dropped just because the previous one hasn't been
-    # processed yet.
+    # Unbounded: a trigger snapshot (or its inspection result) must never be
+    # dropped just because the previous one hasn't been processed yet.
     inspect_queue: "queue.Queue[tuple[str, np.ndarray]]" = queue.Queue()
     snap_event = threading.Event()
     # Set by plc_trigger as soon as a trigger edge is seen, cleared by
@@ -139,28 +115,12 @@ def main() -> None:
     # issued to the PLC at the same time.
     busy_event = threading.Event()
 
-    def on_frame(jpeg_bytes: bytes) -> None:
-        # Drop the previous unsent frame (if any) in favor of the newest one --
-        # capture must never wait for the queue or the network.
-        if frame_queue.full():
-            try:
-                frame_queue.get_nowait()
-            except queue.Empty:
-                pass
-        try:
-            frame_queue.put_nowait(jpeg_bytes)
-        except queue.Full:
-            pass
-
     def on_trigger_frame(bgr: np.ndarray) -> None:
         ts = f"{datetime.now():%Y%m%d_%H%M%S_%f}"
         inspect_queue.put_nowait((ts, bgr))
 
     logger.info("Preloading vision model...")
     vision_detector.preload()
-
-    push_thread = threading.Thread(target=_push_loop, args=(frame_queue, client), daemon=True)
-    push_thread.start()
 
     inspect_thread = threading.Thread(target=_inspect_loop, args=(inspect_queue, busy_event), daemon=True)
     inspect_thread.start()
@@ -171,19 +131,15 @@ def main() -> None:
     trigger_thread.start()
 
     logger.info(
-        "Starting capture, pushing stream to %s, watching PLC %s device %s for trigger snapshots "
-        "(result bits OK=%s NG=%s)",
-        settings.CLOUD_INGEST_URL,
+        "Watching PLC %s device %s for trigger snapshots (result bits OK=%s NG=%s)",
         settings.PLC_HOST,
         settings.CAM_TRIG_DEVICE,
         settings.CAM_RESULT_OK_DEVICE,
         settings.CAM_RESULT_NG_DEVICE,
     )
     try:
-        capture.run(on_frame, on_trigger_frame, snap_event, _stop_event)
+        capture.run(on_trigger_frame, snap_event, _stop_event)
     finally:
         _stop_event.set()
         trigger_thread.join(timeout=5)
-        push_thread.join(timeout=5)
         inspect_thread.join(timeout=5)
-        client.close()

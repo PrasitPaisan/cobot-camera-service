@@ -18,7 +18,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# CPU-only torch wheel first -- otherwise pip pulls ultralytics' default
+# (CUDA-enabled) torch build, which drags in ~1.5GB of nvidia-* packages this
+# industrial PC's CPU-only inference never uses.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
+# ultralytics depends on opencv-python (GUI build, needs libxcb/libGL etc we
+# don't have), which pip installs alongside our opencv-python-headless pin --
+# force headless back in so `import cv2` doesn't need those GUI libs.
+RUN pip uninstall -y opencv-python && \
+    pip install --no-cache-dir --force-reinstall --no-deps opencv-python-headless==5.0.0.93
 
 COPY app ./app
 COPY main.py .

@@ -1,13 +1,12 @@
 """
-Owns the Hikrobot GigE camera: connects by fixed IP, free-runs, converts each
-frame to BGR8, downsizes it, and JPEG-encodes it. Calls on_frame() with the
-encoded bytes for every frame -- main.py wires that callback to push to the
-cloud, same as the continuous stream always has.
-
-Separately, when a PLC camera-trigger edge comes in (snap_event, set by
-app/plc/trigger.py), the current full-resolution frame is also handed to
-on_trigger_frame() as a raw BGR array -- main.py wires that to save a snapshot
-to disk, independent of the (resized) stream.
+Owns the Hikrobot GigE camera: connects by fixed IP and sits idle (no
+free-run, no continuous stream) until a PLC trigger edge comes in
+(snap_event, set by app/plc/trigger.py). On a trigger, fires the camera's
+own software trigger (TriggerMode=ON, TriggerSource=Software) so the camera
+only ever produces a frame when one is actually needed, converts it to BGR8
+full resolution, and hands it to on_trigger_frame() -- main.py wires that to
+detection + saving. Nothing here pushes a live stream anywhere; the camera
+is otherwise silent on the network between triggers.
 """
 
 import logging
@@ -15,7 +14,6 @@ import threading
 from ctypes import c_ubyte, memset, byref, sizeof
 from typing import Callable, Optional
 
-import cv2
 import numpy as np
 
 from app.config import settings
@@ -28,7 +26,7 @@ _SDK_NAMES = (
     "MV_GIGE_DEVICE_INFO",
     "MV_GIGE_DEVICE",
     "MV_ACCESS_Exclusive",
-    "MV_TRIGGER_MODE_OFF",
+    "MV_TRIGGER_MODE_ON",
     "MV_FRAME_OUT",
     "MV_CC_PIXEL_CONVERT_PARAM_EX",
     "PixelType_Gvsp_BGR8_Packed",
@@ -85,20 +83,6 @@ def _frame_to_bgr(cam, frame) -> Optional[np.ndarray]:
     return buf.reshape((height, width, 3)).copy()
 
 
-def _bgr_to_stream_jpeg(bgr: np.ndarray) -> Optional[bytes]:
-    height, width = bgr.shape[:2]
-    max_width = settings.STREAM_MAX_WIDTH
-    if max_width and width > max_width:
-        scale = max_width / width
-        bgr = cv2.resize(bgr, (max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
-
-    ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, settings.JPEG_QUALITY])
-    if not ok:
-        logger.warning("JPEG encode failed")
-        return None
-    return encoded.tobytes()
-
-
 def _teardown_camera(cam) -> None:
     if cam is None:
         return
@@ -109,8 +93,7 @@ def _teardown_camera(cam) -> None:
             pass
 
 
-def _connect_and_grab_loop(
-    on_frame: Callable[[bytes], None],
+def _connect_and_wait_for_triggers(
     on_trigger_frame: Callable[[np.ndarray], None],
     snap_event: threading.Event,
     stop_event: threading.Event,
@@ -140,9 +123,16 @@ def _connect_and_grab_loop(
         else:
             logger.warning("Get optimal packet size failed, ret[0x%x]", n_packet_size)
 
-        ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+        # Software trigger: the camera only produces a frame when we tell it
+        # to (MV_CC_SetCommandValue("TriggerSoftware") below) -- no free-run,
+        # no continuous GVSP traffic between triggers.
+        ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_ON)
         if ret != 0:
             raise RuntimeError(f"set trigger mode fail! ret[0x{ret:x}]")
+
+        ret = cam.MV_CC_SetEnumValueByString("TriggerSource", "Software")
+        if ret != 0:
+            raise RuntimeError(f"set trigger source fail! ret[0x{ret:x}]")
 
         # Same underlying GenICam features MVS's one-click brightness button
         # sets -- fixes the camera opening dark by self-adjusting exposure/gain
@@ -165,15 +155,29 @@ def _connect_and_grab_loop(
         if ret != 0:
             raise RuntimeError(f"start grabbing fail! ret[0x{ret:x}]")
 
-        logger.info("Camera connected at %s, free-run grabbing started", settings.CAMERA_IP)
+        logger.info(
+            "Camera connected at %s, idle -- waiting for PLC triggers (software trigger mode)",
+            settings.CAMERA_IP,
+        )
 
         consecutive_errors = 0
         frame = MV_FRAME_OUT()
         while not stop_event.is_set():
+            if not snap_event.wait(timeout=0.05):
+                continue
+
+            ret = cam.MV_CC_SetCommandValue("TriggerSoftware")
+            if ret != 0:
+                logger.warning("Software trigger command failed, ret[0x%x]", ret)
+                snap_event.clear()
+                continue
+
             memset(byref(frame), 0, sizeof(frame))
             ret = cam.MV_CC_GetImageBuffer(frame, settings.CAMERA_GET_FRAME_TIMEOUT_MS)
             if ret != 0 or frame.pBufAddr is None:
                 consecutive_errors += 1
+                logger.warning("Triggered grab failed, ret[0x%x]", ret)
+                snap_event.clear()
                 if consecutive_errors >= settings.CAMERA_MAX_CONSECUTIVE_ERRORS:
                     raise RuntimeError(f"too many consecutive grab failures, last ret[0x{ret:x}]")
                 continue
@@ -182,21 +186,15 @@ def _connect_and_grab_loop(
             try:
                 bgr = _frame_to_bgr(cam, frame)
                 if bgr is not None:
-                    jpeg_bytes = _bgr_to_stream_jpeg(bgr)
-                    if jpeg_bytes is not None:
-                        on_frame(jpeg_bytes)
-
-                    if snap_event.is_set():
-                        on_trigger_frame(bgr)
-                        snap_event.clear()
+                    on_trigger_frame(bgr)
             finally:
                 cam.MV_CC_FreeImageBuffer(frame)
+                snap_event.clear()
     finally:
         _teardown_camera(cam)
 
 
 def run(
-    on_frame: Callable[[bytes], None],
     on_trigger_frame: Callable[[np.ndarray], None],
     snap_event: threading.Event,
     stop_event: threading.Event,
@@ -207,7 +205,7 @@ def run(
     try:
         while not stop_event.is_set():
             try:
-                _connect_and_grab_loop(on_frame, on_trigger_frame, snap_event, stop_event)
+                _connect_and_wait_for_triggers(on_trigger_frame, snap_event, stop_event)
             except Exception:
                 logger.exception("Camera capture loop crashed, will retry")
             stop_event.wait(settings.CAMERA_RECONNECT_SECONDS)
