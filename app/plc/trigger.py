@@ -31,6 +31,9 @@ logger = logging.getLogger("camera_service.plc_trigger")
 def _read_bit(device: str) -> int:
     mc = pymcprotocol.Type3E()
     mc.setaccessopt(commtype="binary")
+    # pymcprotocol defaults to a 2s socket timeout -- too tight for some
+    # production networks, so widen it before connect() uses it.
+    mc.soc_timeout = settings.PLC_SOCKET_TIMEOUT_SECONDS
     mc.connect(settings.PLC_HOST, settings.PLC_PORT)
     try:
         return mc.batchread_bitunits(headdevice=device, readsize=1)[0]

@@ -77,6 +77,13 @@ class Settings:
     PLC_TRIGGER_POLL_SECONDS = _env_float("PLC_TRIGGER_POLL_SECONDS", 0.5)
     PLC_RECONNECT_SECONDS = _env_float("PLC_RECONNECT_SECONDS", 3)
 
+    # pymcprotocol's own default socket timeout is a hardcoded 2 seconds --
+    # too tight on some production networks (seen timing out consistently on
+    # the Windows Server deploy even though a plain TCP port test succeeds,
+    # just more slowly than 2s). Applied to every connect() call in
+    # app/plc/trigger.py and app/plc/result.py.
+    PLC_SOCKET_TIMEOUT_SECONDS = _env_float("PLC_SOCKET_TIMEOUT_SECONDS", 5.0)
+
     # Same cobot idle/busy bits backend_fast already polls (app/api/routes/
     # prescription.py). Used here only to gate how fast we poll the trigger
     # bit: slow while idle, fast only while the cobot is actually running.
