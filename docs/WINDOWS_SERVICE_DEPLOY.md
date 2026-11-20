@@ -63,6 +63,13 @@ it will likely be `192.168.10.33` here, not whatever it was on the dev
 workstation (`192.168.10.191`). Get it from step 0's `Get-NetIPAddress`
 output.
 
+Everything else -- `CAMERA_BRIGHTNESS_WARMUP_SECONDS`, `CAMERA_DARK_FRAME_THRESHOLD`/
+`CAMERA_BRIGHT_FRAME_THRESHOLD`, `CAMERA_RECALIBRATE_WARMUP_SECONDS`,
+`CAMERA_GET_FRAME_TIMEOUT_MS`, the PLC trigger/result devices -- carry over
+the already-validated values from the dev workstation's `.env` as-is (same
+camera, same lighting rig, same PLC program); these were tuned against
+real hardware, not guessed.
+
 ---
 
 ## 3. Set up the Python environment
@@ -70,11 +77,29 @@ output.
 ```powershell
 cd C:\cobot-camera-service
 python -m venv env
+```
+
+Install a CPU-only `torch` wheel **before** the rest of requirements --
+otherwise `ultralytics` pulls in the default CUDA-enabled build, which
+drags down ~1.5GB of unused `nvidia-*` packages on this CPU-only server
+(same reasoning as the Dockerfile):
+
+```powershell
+.\env\Scripts\pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 .\env\Scripts\pip install -r requirements.txt
 ```
 
-This pulls `ultralytics` (and `torch` as its dependency) -- expect this
-step to take a while and use a few GB of disk.
+`ultralytics` also depends on `opencv-python` (the GUI build, which on
+Windows needs no extra system libraries like it does on Linux, but is
+still unnecessary weight here) alongside our `opencv-python-headless`
+pin. Force headless back in so there's only one `cv2` installed:
+
+```powershell
+.\env\Scripts\pip uninstall -y opencv-python
+.\env\Scripts\pip install --force-reinstall --no-deps opencv-python-headless==5.0.0.93
+```
+
+Expect this whole step to take a while and use a few GB of disk.
 
 ---
 
@@ -104,11 +129,21 @@ actually works on this hardware:
 ```
 
 Watch the log output for:
-- `Camera connected at <CAMERA_IP>, free-run grabbing started` -- camera OK
+- `Camera at <CAMERA_IP> free-running Xs to let brightness settle (initial connect)`
+  followed a bit later by `Post-warmup ExposureTime=... Gain=...` and
+  `Camera at <CAMERA_IP> now idle -- waiting for PLC triggers` -- camera OK.
+  No frames are pushed anywhere during this: the free-run is purely local
+  warmup, then the camera goes silent until a PLC trigger arrives.
 - `Poll: M6000=...` repeating without errors -- PLC OK
 - No `RuntimeError: open device fail!` -- if you see this, the camera isn't
   reachable from here yet (check `CAMERA_IP`/`CAMERA_NET_IP` in `.env`
   match this server's actual NIC and subnet).
+- If a real PLC trigger fires during this smoke test, confirm OK/NG gets
+  written back and a file lands in `adddata\OK\` or `adddata\NG\`. An
+  `ERROR ... consecutive dark/bright triggered frame(s)` line isn't a bug --
+  it means the camera is recalibrating brightness after a lighting
+  mismatch, and that one trigger's result may be wrong; check the saved
+  image at that timestamp.
 
 Let it run for a minute, confirm it behaves, then `Ctrl+C` to stop before
 continuing.
