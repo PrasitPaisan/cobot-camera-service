@@ -12,33 +12,23 @@ missed waiting for a mode switch. The one exception is busy_event: once an
 edge is detected, polling pauses until main.py clears busy_event (once the
 snapshot has been judged and the OK/NG result sent back to the PLC). There's
 no point reading the trigger bit again before that -- the cobot won't raise
-it a second time until it has our result -- and pausing means this module's
-reads and app/plc/result.py's writes are never issued to the PLC at the same
-time, without needing an explicit lock.
+it a second time until it has our result.
+
+Reads go through app/plc/connection.py's shared persistent connection (also
+used by app/plc/result.py's writes) -- that module's lock is what actually
+keeps this module's reads and result.py's writes from hitting the PLC at the
+same time, now that both share one held-open connection instead of each
+opening/closing its own per call.
 """
 
 import logging
 import threading
 from typing import Callable
 
-import pymcprotocol
-
 from app.config import settings
+from app.plc import connection as plc_connection
 
 logger = logging.getLogger("camera_service.plc_trigger")
-
-
-def _read_bit(device: str) -> int:
-    mc = pymcprotocol.Type3E()
-    mc.setaccessopt(commtype="binary")
-    # pymcprotocol defaults to a 2s socket timeout -- too tight for some
-    # production networks, so widen it before connect() uses it.
-    mc.soc_timeout = settings.PLC_SOCKET_TIMEOUT_SECONDS
-    mc.connect(settings.PLC_HOST, settings.PLC_PORT)
-    try:
-        return mc.batchread_bitunits(headdevice=device, readsize=1)[0]
-    finally:
-        mc.close()
 
 
 def _poll_loop(on_trigger: Callable[[], None], stop_event: threading.Event, busy_event: threading.Event) -> None:
@@ -48,7 +38,7 @@ def _poll_loop(on_trigger: Callable[[], None], stop_event: threading.Event, busy
             stop_event.wait(settings.PLC_TRIGGER_POLL_SECONDS)
             continue
 
-        current = _read_bit(settings.CAM_TRIG_DEVICE)
+        current = plc_connection.read_bit(settings.CAM_TRIG_DEVICE)
         logger.debug("Poll: %s=%s", settings.CAM_TRIG_DEVICE, current)
         if current == 1 and previous == 0:
             logger.info(

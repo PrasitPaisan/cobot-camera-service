@@ -7,17 +7,17 @@ only means the TCP request/response round-tripped, not that the PLC's
 program actually picked the bit up. Each write is retried a few times before
 giving up, since the reset-to-0 step in particular must not silently fail --
 if it does, the bit is left stuck at 1 until the next trigger's pulse happens
-to clear it. Connects over PLC_PORT, the same dedicated port
-app/plc/trigger.py reads CAM_TRIG_DEVICE on (each call opens and closes its
-own short-lived connection, so the two never hold it open at once).
+to clear it. Writes go through app/plc/connection.py's shared persistent
+connection, the same dedicated PLC_PORT app/plc/trigger.py reads
+CAM_TRIG_DEVICE on -- that module's lock keeps the two from hitting the PLC
+at the same time.
 """
 
 import logging
 import time
 
-import pymcprotocol
-
 from app.config import settings
+from app.plc import connection as plc_connection
 
 logger = logging.getLogger("camera_service.plc_result")
 
@@ -26,19 +26,7 @@ _WRITE_RETRY_DELAY_SECONDS = 0.2
 
 
 def _write_and_confirm_bit(device: str, value: int) -> bool:
-    mc = pymcprotocol.Type3E()
-    mc.setaccessopt(commtype="binary")
-    # pymcprotocol defaults to a 2s socket timeout -- too tight for some
-    # production networks, so widen it before connect() uses it.
-    mc.soc_timeout = settings.PLC_SOCKET_TIMEOUT_SECONDS
-    mc.connect(settings.PLC_HOST, settings.PLC_PORT)
-    try:
-        mc.batchwrite_bitunits(headdevice=device, values=[value])
-        readback = mc.batchread_bitunits(headdevice=device, readsize=1)[0]
-    finally:
-        mc.close()
-
-    return readback == value
+    return plc_connection.write_and_confirm_bit(device, value)
 
 
 def _write_with_retries(device: str, value: int) -> bool:
